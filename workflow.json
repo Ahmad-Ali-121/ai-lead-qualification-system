@@ -1,0 +1,569 @@
+{
+  "name": "01 — Lead Capture → AI Scoring → CRM Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SECTION 1 — INTAKE\nWebhook receives form submissions (name, email, company, phone, message).\nInput validation strips whitespace, verifies email format, and normalizes fields before scoring.",
+        "height": 260,
+        "width": 460,
+        "color": 4
+      },
+      "id": "sticky-intake",
+      "name": "Sticky: Intake",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-100, -320]
+    },
+    {
+      "parameters": {
+        "content": "## SECTION 2 — AI SCORING\nGPT-4o reads the lead payload and returns a JSON object:\n{ score: 0-100, tier: HOT|WARM|COLD, reason: string }\nThe Switch node then routes based on `tier`.",
+        "height": 260,
+        "width": 460,
+        "color": 5
+      },
+      "id": "sticky-scoring",
+      "name": "Sticky: AI Scoring",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [820, -320]
+    },
+    {
+      "parameters": {
+        "content": "## SECTION 3 — TIER ROUTING\nHOT → GPT-4o writes a personalized email → Gmail sends immediately.\nWARM → Airtable is tagged with `drip_sequence` for a scheduled campaign to pick up.\nCOLD → falls through to CRM save only.",
+        "height": 260,
+        "width": 700,
+        "color": 3
+      },
+      "id": "sticky-routing",
+      "name": "Sticky: Routing",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1700, -320]
+    },
+    {
+      "parameters": {
+        "content": "## SECTION 4 — PERSIST + NOTIFY\nEvery lead (regardless of tier) is written to Airtable CRM, logged to Google Sheets with a timestamp, and summarized to the sales Slack channel.\nWebhook response returns the tier + score to the calling form.",
+        "height": 260,
+        "width": 700,
+        "color": 6
+      },
+      "id": "sticky-persist",
+      "name": "Sticky: Persist + Notify",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [2600, -320]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "id": "node-webhook",
+      "name": "Webhook — Lead Form",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-40, 0],
+      "webhookId": "lead-intake-webhook"
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Input validation and normalization.\n// Rejects the request early if required fields are missing or the email is malformed.\nconst body = $input.first().json.body ?? $input.first().json;\n\nconst required = ['name', 'email', 'company', 'phone', 'message'];\nconst missing = required.filter(f => !body[f] || String(body[f]).trim() === '');\n\nif (missing.length > 0) {\n  throw new Error(`Validation failed. Missing fields: ${missing.join(', ')}`);\n}\n\nconst emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nif (!emailRegex.test(body.email)) {\n  throw new Error(`Invalid email format: ${body.email}`);\n}\n\nreturn [{\n  json: {\n    name: String(body.name).trim(),\n    email: String(body.email).trim().toLowerCase(),\n    company: String(body.company).trim(),\n    phone: String(body.phone).trim(),\n    message: String(body.message).trim(),\n    source: body.source || 'website_form',\n    received_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node-validate",
+      "name": "Validate + Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [180, 0]
+    },
+    {
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list"
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a B2B lead qualification engine. Given a lead payload, respond with STRICT JSON only (no prose, no markdown fences) matching this schema:\n{ \"score\": integer 0-100, \"tier\": \"HOT\" | \"WARM\" | \"COLD\", \"reason\": string (max 200 chars), \"suggested_next_step\": string }\n\nScoring rubric:\n- HOT (75-100): explicit buying intent, decision-maker language, urgency, named budget.\n- WARM (40-74): active problem, evaluating options, no urgency.\n- COLD (0-39): browsing, student, unclear intent, personal email domain with no company signal."
+            },
+            {
+              "role": "user",
+              "content": "=Lead payload:\nName: {{$json.name}}\nEmail: {{$json.email}}\nCompany: {{$json.company}}\nPhone: {{$json.phone}}\nMessage: {{$json.message}}\nSource: {{$json.source}}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "id": "node-score",
+      "name": "GPT-4o — Score Lead",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.6,
+      "position": [400, 0],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-cred-001",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Merge the AI scoring output back onto the lead payload so downstream nodes\n// have a single, flat object to work with.\nconst lead = $('Validate + Normalize').first().json;\nconst aiRaw = $input.first().json;\n\n// LangChain OpenAI node returns the parsed JSON on `message.content` or root depending on version.\nlet parsed;\nif (aiRaw.message && aiRaw.message.content) {\n  parsed = typeof aiRaw.message.content === 'string' ? JSON.parse(aiRaw.message.content) : aiRaw.message.content;\n} else if (aiRaw.content) {\n  parsed = typeof aiRaw.content === 'string' ? JSON.parse(aiRaw.content) : aiRaw.content;\n} else {\n  parsed = aiRaw;\n}\n\nconst tier = (parsed.tier || 'COLD').toUpperCase();\nconst score = Number(parsed.score) || 0;\n\nreturn [{\n  json: {\n    ...lead,\n    score,\n    tier,\n    ai_reason: parsed.reason || '',\n    suggested_next_step: parsed.suggested_next_step || '',\n    scored_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node-merge-score",
+      "name": "Merge Score → Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [620, 0]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.tier}}",
+                    "rightValue": "HOT",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "HOT"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.tier}}",
+                    "rightValue": "WARM",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "WARM"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.tier}}",
+                    "rightValue": "COLD",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "COLD"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "UNKNOWN"
+        }
+      },
+      "id": "node-switch-tier",
+      "name": "Switch — Tier",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [840, 0]
+    },
+    {
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list"
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You write short, direct B2B outreach emails. No fluff, no exclamation marks, no 'I hope this finds you well'. Reference the lead's actual message. Sign off as 'Sales Team'. Return STRICT JSON: { \"subject\": string, \"body\": string (plain text, 3-5 short paragraphs) }."
+            },
+            {
+              "role": "user",
+              "content": "=Write a first-touch email to this lead.\nName: {{$json.name}}\nCompany: {{$json.company}}\nTheir message: {{$json.message}}\nSuggested next step: {{$json.suggested_next_step}}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {
+          "temperature": 0.6
+        }
+      },
+      "id": "node-hot-email-gen",
+      "name": "GPT-4o — Write HOT Email",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.6,
+      "position": [1160, -240],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-cred-001",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Flatten AI email output onto the lead record for Gmail node consumption.\nconst lead = $('Merge Score → Lead').first().json;\nconst aiRaw = $input.first().json;\n\nlet parsed;\nif (aiRaw.message && aiRaw.message.content) {\n  parsed = typeof aiRaw.message.content === 'string' ? JSON.parse(aiRaw.message.content) : aiRaw.message.content;\n} else if (aiRaw.content) {\n  parsed = typeof aiRaw.content === 'string' ? JSON.parse(aiRaw.content) : aiRaw.content;\n} else {\n  parsed = aiRaw;\n}\n\nreturn [{\n  json: {\n    ...lead,\n    email_subject: parsed.subject,\n    email_body: parsed.body\n  }\n}];"
+      },
+      "id": "node-hot-prep",
+      "name": "Prep HOT Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1380, -240]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{$json.email}}",
+        "subject": "={{$json.email_subject}}",
+        "emailType": "text",
+        "message": "={{$json.email_body}}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "node-gmail-hot",
+      "name": "Gmail — Send HOT",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1600, -240],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-cred-001",
+          "name": "Gmail OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": {
+          "__rl": true,
+          "value": "appXXXXXXXXXXXXXX",
+          "mode": "id"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblLeads",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Name": "={{$json.name}}",
+            "Email": "={{$json.email}}",
+            "Company": "={{$json.company}}",
+            "Phone": "={{$json.phone}}",
+            "Message": "={{$json.message}}",
+            "Tier": "={{$json.tier}}",
+            "Score": "={{$json.score}}",
+            "AI Reason": "={{$json.ai_reason}}",
+            "Tags": "drip_sequence",
+            "Source": "={{$json.source}}",
+            "Received At": "={{$json.received_at}}"
+          }
+        }
+      },
+      "id": "node-airtable-warm",
+      "name": "Airtable — WARM Drip Tag",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1160, 0],
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "airtable-cred-001",
+          "name": "Airtable Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Pass-through for COLD tier — no outreach, straight to CRM save.\nreturn $input.all();"
+      },
+      "id": "node-cold-pass",
+      "name": "COLD → CRM Only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1160, 240]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": {
+          "__rl": true,
+          "value": "appXXXXXXXXXXXXXX",
+          "mode": "id"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblLeads",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Name": "={{$json.name}}",
+            "Email": "={{$json.email}}",
+            "Company": "={{$json.company}}",
+            "Phone": "={{$json.phone}}",
+            "Message": "={{$json.message}}",
+            "Tier": "={{$json.tier}}",
+            "Score": "={{$json.score}}",
+            "AI Reason": "={{$json.ai_reason}}",
+            "Suggested Next Step": "={{$json.suggested_next_step}}",
+            "Source": "={{$json.source}}",
+            "Received At": "={{$json.received_at}}"
+          }
+        }
+      },
+      "id": "node-airtable-crm",
+      "name": "Airtable — CRM Save",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1980, 0],
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "airtable-cred-001",
+          "name": "Airtable Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0XXXXXXXXX",
+          "mode": "id"
+        },
+        "text": "=:bust_in_silhouette: *New {{$json.tier}} lead* — Score {{$json.score}}/100\n*Name:* {{$json.name}} ({{$json.company}})\n*Email:* {{$json.email}} | *Phone:* {{$json.phone}}\n*Reason:* {{$json.ai_reason}}\n*Next step:* {{$json.suggested_next_step}}",
+        "otherOptions": {}
+      },
+      "id": "node-slack-notify",
+      "name": "Slack — Sales Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2200, 0],
+      "credentials": {
+        "slackApi": {
+          "id": "slack-cred-001",
+          "name": "Slack API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1XXXXXXXXXXXXXXXXXXXXXXXXX",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads Log",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{$json.received_at}}",
+            "Name": "={{$json.name}}",
+            "Email": "={{$json.email}}",
+            "Company": "={{$json.company}}",
+            "Phone": "={{$json.phone}}",
+            "Tier": "={{$json.tier}}",
+            "Score": "={{$json.score}}",
+            "AI Reason": "={{$json.ai_reason}}",
+            "Source": "={{$json.source}}"
+          }
+        }
+      },
+      "id": "node-sheets-log",
+      "name": "Sheets — Log Lead",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [2420, 0],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "gsheets-cred-001",
+          "name": "Google Sheets OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"received\", \"tier\": \"{{$json.tier}}\", \"score\": {{$json.score}}, \"lead_id\": \"{{$json.email}}\", \"received_at\": \"{{$json.received_at}}\" }",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "node-respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2640, 0]
+    },
+    {
+      "parameters": {},
+      "id": "node-error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-40, 500]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0XXXXXXXXX",
+          "mode": "id"
+        },
+        "text": "=:rotating_light: *Lead pipeline error*\n*Workflow:* {{$json.workflow.name}}\n*Node:* {{$json.execution.lastNodeExecuted}}\n*Error:* {{$json.execution.error.message}}\n*Execution URL:* {{$json.execution.url}}",
+        "otherOptions": {}
+      },
+      "id": "node-error-slack",
+      "name": "Slack — Error Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [200, 500],
+      "credentials": {
+        "slackApi": {
+          "id": "slack-cred-001",
+          "name": "Slack API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook — Lead Form": {
+      "main": [[{ "node": "Validate + Normalize", "type": "main", "index": 0 }]]
+    },
+    "Validate + Normalize": {
+      "main": [[{ "node": "GPT-4o — Score Lead", "type": "main", "index": 0 }]]
+    },
+    "GPT-4o — Score Lead": {
+      "main": [[{ "node": "Merge Score → Lead", "type": "main", "index": 0 }]]
+    },
+    "Merge Score → Lead": {
+      "main": [[{ "node": "Switch — Tier", "type": "main", "index": 0 }]]
+    },
+    "Switch — Tier": {
+      "main": [
+        [{ "node": "GPT-4o — Write HOT Email", "type": "main", "index": 0 }],
+        [{ "node": "Airtable — WARM Drip Tag", "type": "main", "index": 0 }],
+        [{ "node": "COLD → CRM Only", "type": "main", "index": 0 }],
+        [{ "node": "COLD → CRM Only", "type": "main", "index": 0 }]
+      ]
+    },
+    "GPT-4o — Write HOT Email": {
+      "main": [[{ "node": "Prep HOT Email", "type": "main", "index": 0 }]]
+    },
+    "Prep HOT Email": {
+      "main": [[{ "node": "Gmail — Send HOT", "type": "main", "index": 0 }]]
+    },
+    "Gmail — Send HOT": {
+      "main": [[{ "node": "Airtable — CRM Save", "type": "main", "index": 0 }]]
+    },
+    "Airtable — WARM Drip Tag": {
+      "main": [[{ "node": "Airtable — CRM Save", "type": "main", "index": 0 }]]
+    },
+    "COLD → CRM Only": {
+      "main": [[{ "node": "Airtable — CRM Save", "type": "main", "index": 0 }]]
+    },
+    "Airtable — CRM Save": {
+      "main": [[{ "node": "Slack — Sales Alert", "type": "main", "index": 0 }]]
+    },
+    "Slack — Sales Alert": {
+      "main": [[{ "node": "Sheets — Log Lead", "type": "main", "index": 0 }]]
+    },
+    "Sheets — Log Lead": {
+      "main": [[{ "node": "Respond to Webhook", "type": "main", "index": 0 }]]
+    },
+    "Error Trigger": {
+      "main": [[{ "node": "Slack — Error Alert", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": [
+    { "name": "ai" },
+    { "name": "sales" },
+    { "name": "crm" }
+  ],
+  "_meta": {
+    "description": "Webhook-driven lead capture pipeline. Validates form input, scores the lead with GPT-4o into HOT/WARM/COLD tiers, routes HOT leads to a personalized Gmail outreach, tags WARM leads for a drip sequence, saves every lead to Airtable CRM, alerts the sales Slack channel, logs to Google Sheets, and responds to the calling form with tier + score. Includes a global Error Trigger that pipes any node failure to Slack.",
+    "tools_used": [
+      "n8n-nodes-base.webhook",
+      "n8n-nodes-base.code",
+      "@n8n/n8n-nodes-langchain.openAi (GPT-4o)",
+      "n8n-nodes-base.switch",
+      "n8n-nodes-base.gmail",
+      "n8n-nodes-base.airtable",
+      "n8n-nodes-base.slack",
+      "n8n-nodes-base.googleSheets",
+      "n8n-nodes-base.respondToWebhook",
+      "n8n-nodes-base.errorTrigger"
+    ],
+    "credentials_needed": [
+      { "id": "openai-cred-001", "type": "openAiApi", "purpose": "GPT-4o scoring + email generation" },
+      { "id": "gmail-cred-001", "type": "gmailOAuth2", "purpose": "Send HOT-lead outreach emails" },
+      { "id": "airtable-cred-001", "type": "airtableTokenApi", "purpose": "CRM record create + drip tagging" },
+      { "id": "slack-cred-001", "type": "slackApi", "purpose": "Sales alerts + error alerts" },
+      { "id": "gsheets-cred-001", "type": "googleSheetsOAuth2Api", "purpose": "Append to Leads Log" }
+    ],
+    "how_to_import": "1) In n8n go to Workflows → Import from File and pick this JSON. 2) Open each node with a credential slot and bind it to your own credentials (the IDs above are placeholders). 3) Replace the Airtable base/table IDs, the Google Sheet ID, and the Slack channel ID with your own. 4) Set the workflow to Active. 5) POST a test lead to the webhook path /webhook/lead-intake with JSON body { name, email, company, phone, message }. 6) In Workflow Settings → Error Workflow, select this same workflow so the Error Trigger fires on failures."
+  }
+}
